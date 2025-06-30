@@ -1,0 +1,110 @@
+# nginx.conf.template
+
+worker_processes auto;
+
+# مسیر فایل PID در اینجا تنظیم نمی‌شود، چون از طریق -g در entrypoint.sh پاس داده می‌شود.
+# pid /var/run/nginx.pid; # این خط غیرفعال است
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    # مسیرهای موقت برای Nginx، مطمئن شوید /tmp قابل نوشتن است (که معمولا هست)
+    client_body_temp_path /tmp/client_body_temp 1 2;
+    proxy_temp_path       /tmp/proxy_temp 1 2;
+    fastcgi_temp_path     /tmp/fastcgi_temp 1 2;
+    uwsgi_temp_path       /tmp/uwsgi_temp 1 2;
+    scgi_temp_path        /tmp/scgi_temp 1 2;
+
+    # لاگ‌ها به stdout و stderr هدایت می‌شوند تا در لاگ‌های کانتینر نمایش داده شوند
+    access_log /dev/stdout;
+    error_log  /dev/stderr notice; # می‌توانید سطح لاگ را به warn یا error تغییر دهید
+
+    sendfile        on;
+    tcp_nopush      on;
+    tcp_nodelay     on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    # server_tokens off; # هدر Server را با جزئیات نسخه Nginx مخفی می‌کند (اختیاری)
+
+    upstream target_huggingface_space {
+        # ${TARGET_HOSTNAME_NO_SCHEME} توسط entrypoint.sh از TARGET_HF_SPACE_URL استخراج می‌شود
+        server ${TARGET_HOSTNAME_NO_SCHEME}:443;
+        # keepalive 16; # برای بهبود عملکرد با استفاده مجدد از کانکشن‌ها (اختیاری)
+    }
+
+    server {
+        listen 7860 default_server;
+        server_name _; # به هر هاست‌نیمی پاسخ می‌دهد
+
+        # --- مهم: این بخش هدرهای مشخصی را از پاسخ سرور هدف حذف می‌کند ---
+        proxy_hide_header Link;                 # این هدر URL کنونیکال را فاش می‌کند
+        proxy_hide_header X-Canonical-Url;      # برای اطمینان، اگر هدر دیگری هم بود
+        proxy_hide_header X-Powered-By;         # اطلاعات سرور بک‌اند را مخفی می‌کند
+        proxy_hide_header Server;               # اطلاعات سرور بک‌اند را مخفی می‌کند (اگر upstream خودش تنظیم نکند)
+        # --- پایان بخش مهم ---
+
+        # هدرهای امنیتی که شما اضافه کرده بودید، حفظ شده‌اند
+        proxy_hide_header X-Frame-Options; # از پاسخ بک‌اند حذف شود تا add_header ما اعمال شود
+        proxy_hide_header Content-Security-Policy; # از پاسخ بک‌اند حذف شود تا add_header ما اعمال شود
+        
+        # اضافه کردن هدرهای امنیتی توسط پروکسی
+        add_header X-Frame-Options "SAMEORIGIN" always; # یا "DENY" اگر نمی‌خواهید در هیچ iframe ای نمایش داده شود
+        add_header Content-Security-Policy "frame-ancestors 'self' *; script-src 'self' 'unsafe-inline' https: data: blob:; object-src 'none'; base-uri 'self';" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        # add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always; # اگر HTTPS همیشه فعال است
+
+        # تنظیمات sub_filter برای تزریق اسکریپت (فقط برای محتوای text/html)
+        sub_filter_types text/html;
+        sub_filter_once on; # فقط اولین تطابق را جایگزین می‌کند (مهم برای <head>)
+
+        # اسکریپت کامل‌تر برای غیرفعال کردن تمام متدهای console (همانطور که شما داشتید)
+        set $console_disabler_script_full "<script id='hf-proxy-console-disabler-full'>\n(function() {\n    if (window.hfProxyConsoleFullyDisabled) return;\n    window.hfProxyConsoleFullyDisabled = true;\n    var preservedConsoleLogForProxy;\n    try {\n        if (window.console && typeof window.console.log === 'function') {\n            preservedConsoleLogForProxy = window.console.log.bind(window.console);\n        } else {\n            preservedConsoleLogForProxy = function(){};\n        }\n    } catch (e) {\n        preservedConsoleLogForProxy = function(){};\n    }\n    var noop = function() {};\n    var consoleMethods = [\n        'assert', 'clear', 'count', 'debug', 'dir', 'dirxml', 'error',\n        'group', 'groupCollapsed', 'groupEnd', 'info', 'log', 'markTimeline',\n        'profile', 'profileEnd', 'table', 'time', 'timeEnd', 'timeStamp', 'trace', 'warn'\n    ];\n    var newConsoleReplacement = {};\n    for (var i = 0; i < consoleMethods.length; i++) {\n        newConsoleReplacement[consoleMethods[i]] = noop;\n    }\n    try {\n        if (typeof window.console !== 'undefined') {\n            Object.defineProperty(window, 'console', {\n                value: newConsoleReplacement,\n                writable: false,\n                configurable: false\n            });\n        } else {\n             Object.defineProperty(window, 'console', {\n                value: newConsoleReplacement,\n                writable: false,\n                configurable: false\n            });\n        }\n    } catch (e) {\n        window.console = newConsoleReplacement;\n    }\n})();\n</script>";
+
+        # تزریق اسکریپت غیرفعال‌کننده کنسول بلافاصله بعد از تگ <head>
+        sub_filter '<head>' '<head>$console_disabler_script_full';
+        # sub_filter '</head>' '$console_disabler_script_full</head>'; # جایگزین اگر <head> صفات داشته باشد
+
+        location / {
+            proxy_pass https://target_huggingface_space; # از upstream تعریف شده استفاده می‌کند
+
+            # تنظیم هدرهای مهم برای ارسال به سرور هدف
+            proxy_set_header Host ${TARGET_HOSTNAME_NO_SCHEME}; # بسیار مهم: هاست اسپیس اصلی
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $host; # هاست پروکسی فعلی (مثلا your-proxy-space.hf.space)
+            proxy_set_header X-Forwarded-Port $server_port; # پورت پروکسی فعلی
+            
+            proxy_http_version 1.1;
+            proxy_set_header Connection ""; # برای مدیریت بهتر کانکشن‌ها توسط Nginx
+            proxy_buffering on; # بافر کردن پاسخ از بک‌اند می‌تواند عملکرد را بهبود بخشد
+
+            # تایم‌اوت‌ها (اختیاری، مقادیر پیش‌فرض معمولا مناسب هستند)
+            # proxy_connect_timeout 60s;
+            # proxy_send_timeout 60s;
+            # proxy_read_timeout 60s;
+        }
+
+        location = /ws { # مسیر WebSocket (اگر اسپیس شما از WebSocket استفاده می‌کند)
+            proxy_pass https://target_huggingface_space/ws; # مطمئن شوید مسیر /ws در اسپیس هدف صحیح است
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host ${TARGET_HOSTNAME_NO_SCHEME}; # هاست اسپیس اصلی
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # تایم‌اوت‌های طولانی‌تر برای WebSocket
+            proxy_connect_timeout 7d; 
+            proxy_send_timeout    7d;
+            proxy_read_timeout    7d;
+        }
+    }
+}
