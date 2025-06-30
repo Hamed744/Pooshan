@@ -1,0 +1,5 @@
+Flask
+requests
+beautifulsoup4
+lxml
+# gunicorn # اگر از Gunicorn برای اجرای Flask استفاده می‌کنید، این را از کامنت خارج کنید
